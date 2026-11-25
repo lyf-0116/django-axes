@@ -76,18 +76,24 @@ def get_cache() -> BaseCache:
 
 def get_cache_timeout(request: Optional[HttpRequest] = None) -> Optional[int]:
     """
-    Return the cache timeout interpreted from settings.AXES_COOLOFF_TIME.
+    Return the cache timeout for the request's lockout window.
 
     The cache timeout can be either None if not configured or integer of seconds if configured.
 
-    Notice that the settings.AXES_COOLOFF_TIME can be None, timedelta, float, integer, callable, or str path,
-    and this function offers a unified _integer or None_ representation of that configuration
-    for use with the Django cache backends.
+    When ``AXES_LOCKOUT_TIERS`` is configured the timeout comes from the
+    matching tier (or the first tier before any failure is recorded), so
+    tiered lockouts keep expiring even with ``AXES_COOLOFF_TIME`` unset.
+    Otherwise the timeout is interpreted from ``AXES_COOLOFF_TIME``, which
+    can be None, timedelta, float, integer, callable, or str path.
     """
 
     cool_off = get_cool_off(request)
     if cool_off is None:
-        return None
+        if request is not None and settings.AXES_LOCKOUT_TIERS:
+            failures = getattr(request, "axes_failures_since_start", None)
+            cool_off = get_cool_off_for_failures(failures or 1)
+        if cool_off is None:
+            return None
     return int(cool_off.total_seconds())
 
 
@@ -165,6 +171,58 @@ def get_lockout_tier(failures: int) -> Optional[LockoutTier]:
     return matched
 
 
+def get_cool_off_for_failures(failures: int) -> Optional[timedelta]:
+    """
+    Return the cool-off window that applies to *failures*.
+
+    When ``AXES_LOCKOUT_TIERS`` is configured, the highest tier whose
+    threshold is met determines the window. Failures below the first tier
+    use the first tier's cool-off so that their window is known too; without
+    tiers the global ``AXES_COOLOFF_TIME`` is used instead.
+    """
+
+    tiers = settings.AXES_LOCKOUT_TIERS
+    if tiers:
+        sorted_tiers = sorted(tiers, key=lambda t: t.failures)
+        tier = get_lockout_tier(failures)
+        if tier is None:
+            tier = sorted_tiers[0]
+        return tier.cooloff
+
+    return get_cool_off()
+
+
+def get_attempt_cool_off(attempt: AccessBase) -> Optional[timedelta]:
+    """
+    Return the cool-off window recorded for *attempt*.
+
+    Prefer the window stored on the record so cleanup and count queries use
+    the tier the attempt actually belongs to. Legacy records without a
+    stored window fall back to the tier matching their failure count and
+    finally to the global cool-off setting.
+    """
+
+    if attempt.cooloff_seconds is not None:
+        return timedelta(seconds=attempt.cooloff_seconds)
+
+    return get_cool_off_for_failures(attempt.failures_since_start)
+
+
+def is_attempt_expired(attempt: AccessBase, reference_time: datetime) -> bool:
+    """
+    Return whether *attempt* is older than its own cool-off window.
+
+    Attempts without a cool-off window never expire and have to be reset
+    manually. Windows are measured from the recorded attempt time.
+    """
+
+    cool_off = get_attempt_cool_off(attempt)
+    if cool_off is None:
+        return False
+
+    return attempt.attempt_time + cool_off <= reference_time
+
+
 def resolve_tier_from_request(
     request: Optional[HttpRequest],
 ) -> Optional[LockoutTier]:
@@ -179,10 +237,19 @@ def resolve_tier_from_request(
 
 def get_attempt_expiration(request: Optional[HttpRequest] = None) -> datetime:
     """
-    Get threshold for fetching access attempts from the database.
+    Get the expiration timestamp for an access attempt.
+
+    The cool-off window is resolved from the request's lockout tier when
+    ``AXES_LOCKOUT_TIERS`` is configured, otherwise from
+    ``AXES_COOLOFF_TIME``. Raises ``TypeError`` only when neither provides
+    a window.
     """
 
     cool_off = get_cool_off(request)
+    if cool_off is None:
+        if request is not None:
+            failures = getattr(request, "axes_failures_since_start", None)
+            cool_off = get_cool_off_for_failures(failures or 1)
     if cool_off is None:
         raise TypeError(
             "Cool off threshold can not be calculated with settings.AXES_COOLOFF_TIME set to None"

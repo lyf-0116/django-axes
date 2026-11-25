@@ -2,6 +2,18 @@
 Changes
 =======
 
+Unreleased
+----------
+
+- Track the cool-off window of each ``AccessAttempt`` in the new
+  ``cooloff_seconds`` field so ``AXES_LOCKOUT_TIERS`` work with
+  ``AXES_COOLOFF_TIME`` left unset. Failure counts and expired-attempt
+  cleanup now use the tier window stored on each record instead of the
+  global cool-off, and higher-tier attempts are kept until their own
+  longer window elapses, preventing tier downgrade attacks. Run
+  ``python manage.py migrate`` to install the
+  ``axes.0011_accessattempt_cooloff_seconds`` migration.
+
 9.1.0 (2026-11-22)
 ------------------
 

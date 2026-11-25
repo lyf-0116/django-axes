@@ -42,6 +42,18 @@ class AccessAttempt(AccessBase):
 
     failures_since_start = models.PositiveIntegerField(_("Failed Logins"))
 
+    cooloff_seconds = models.PositiveIntegerField(
+        _("Cool-off Seconds"),
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=_(
+            "Cool-off window that applies to this attempt, resolved from the "
+            "lockout tier matched when the attempt was recorded. Null means a "
+            "permanent attempt that does not expire automatically."
+        ),
+    )
+
     def __str__(self):
         return f"Attempted Access: {self.attempt_time}"
 

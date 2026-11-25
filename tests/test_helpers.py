@@ -10,6 +10,7 @@ from axes.apps import AppConfig
 from axes.conf import LockoutTier
 from axes.helpers import (
     cleanse_parameters,
+    get_attempt_cool_off,
     get_cache_timeout,
     get_client_cache_keys,
     get_client_ip_address,
@@ -17,10 +18,12 @@ from axes.helpers import (
     get_client_str,
     get_client_username,
     get_cool_off,
+    get_cool_off_for_failures,
     get_cool_off_iso8601,
     get_lockout_response,
     get_username_from_data,
     get_lockout_tier,
+    is_attempt_expired,
     is_client_ip_address_blacklisted,
     is_client_ip_address_whitelisted,
     is_client_method_whitelisted,
@@ -32,6 +35,7 @@ from axes.helpers import (
     toggleable,
 )
 from axes.models import AccessAttempt, AccessBase
+from django.utils import timezone
 from tests.base import AxesTestCase
 
 
@@ -1445,6 +1449,104 @@ class AxesLockoutTiersTestCase(AxesTestCase):
         data = json.loads(response.content)
         self.assertEqual(data["failure_count"], 3)
         self.assertIn("cooloff_time", data)
+
+    # -- get_cool_off_for_failures with tiers --
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS, AXES_COOLOFF_TIME=None)
+    def test_get_cool_off_for_failures_uses_matching_tier(self):
+        self.assertEqual(get_cool_off_for_failures(6), timedelta(hours=2))
+        self.assertEqual(get_cool_off_for_failures(10), timedelta(days=1))
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS, AXES_COOLOFF_TIME=None)
+    def test_get_cool_off_for_failures_below_first_tier_uses_first_window(self):
+        self.assertEqual(get_cool_off_for_failures(1), timedelta(minutes=15))
+
+    @override_settings(AXES_LOCKOUT_TIERS=None, AXES_COOLOFF_TIME=timedelta(hours=2))
+    def test_get_cool_off_for_failures_without_tiers_uses_global_cooloff(self):
+        self.assertEqual(get_cool_off_for_failures(1), timedelta(hours=2))
+
+    @override_settings(AXES_LOCKOUT_TIERS=None, AXES_COOLOFF_TIME=None)
+    def test_get_cool_off_for_failures_without_any_window_is_none(self):
+        self.assertIsNone(get_cool_off_for_failures(1))
+
+    # -- per-attempt window resolution --
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS)
+    def test_get_attempt_cool_off_prefers_stored_window(self):
+        attempt = AccessAttempt(
+            username="tier-user",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=2,
+            cooloff_seconds=int(timedelta(hours=2).total_seconds()),
+        )
+        self.assertEqual(get_attempt_cool_off(attempt), timedelta(hours=2))
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS)
+    def test_get_attempt_cool_off_legacy_record_falls_back_to_tier(self):
+        attempt = AccessAttempt(
+            username="legacy-user",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=6,
+            cooloff_seconds=None,
+        )
+        self.assertEqual(get_attempt_cool_off(attempt), timedelta(hours=2))
+
+    @override_settings(AXES_LOCKOUT_TIERS=None, AXES_COOLOFF_TIME=None)
+    def test_get_attempt_cool_off_permanent_record_is_none(self):
+        attempt = AccessAttempt(
+            username="permanent-user",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=99,
+            cooloff_seconds=None,
+        )
+        self.assertIsNone(get_attempt_cool_off(attempt))
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS)
+    def test_is_attempt_expired_uses_record_window(self):
+        now = timezone.now()
+        recent = AccessAttempt(
+            username="recent",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=10,
+            attempt_time=now - timedelta(hours=12),
+            cooloff_seconds=int(timedelta(days=1).total_seconds()),
+        )
+        stale = AccessAttempt(
+            username="stale",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=3,
+            attempt_time=now - timedelta(minutes=16),
+            cooloff_seconds=int(timedelta(minutes=15).total_seconds()),
+        )
+        self.assertFalse(is_attempt_expired(recent, now))
+        self.assertTrue(is_attempt_expired(stale, now))
+
+    @override_settings(AXES_LOCKOUT_TIERS=None, AXES_COOLOFF_TIME=None)
+    def test_is_attempt_expired_permanent_record_never_expires(self):
+        attempt = AccessAttempt(
+            username="forever",
+            ip_address="127.0.0.1",
+            user_agent="agent",
+            failures_since_start=1,
+            attempt_time=timezone.now() - timedelta(days=400),
+            cooloff_seconds=None,
+        )
+        self.assertFalse(is_attempt_expired(attempt, timezone.now()))
+
+    @override_settings(AXES_LOCKOUT_TIERS=SAMPLE_TIERS, AXES_COOLOFF_TIME=None)
+    def test_get_attempt_expiration_resolves_tier_without_request_failures(self):
+        from axes.helpers import get_attempt_expiration
+
+        request = HttpRequest()
+        request.axes_attempt_time = timezone.now()
+        request.axes_failures_since_start = None
+        expiration = get_attempt_expiration(request)
+        self.assertEqual(expiration - request.axes_attempt_time, timedelta(minutes=15))
 
 
 class ResolveCallableTestCase(AxesTestCase):

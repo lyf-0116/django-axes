@@ -121,7 +121,7 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
                 failures.append(1)
             else:
                 try:
-                    failures.append(self.cache.incr(key=cache_key, delta=1))
+                    new_count = self.cache.incr(key=cache_key, delta=1)
                 except ValueError:
                     # The key expired between the add and the incr above, so
                     # the cool off period has elapsed and this failure starts a
@@ -130,7 +130,11 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
                     self.cache.add(key=cache_key, value=1, timeout=cache_timeout)
                     failures.append(1)
                 else:
-                    self.cache.touch(key=cache_key, timeout=cache_timeout)
+                    failures.append(new_count)
+                    # Re-resolve the timeout because crossing a tier boundary
+                    # extends the window even while AXES_COOLOFF_TIME is unset.
+                    request.axes_failures_since_start = new_count
+                    self.cache.touch(key=cache_key, timeout=get_cache_timeout(request))
 
         failures_since_start = max(failures)
         request.axes_failures_since_start = failures_since_start

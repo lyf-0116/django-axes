@@ -4,6 +4,8 @@ from django.test import override_settings
 from django.utils import timezone
 from axes.handlers.database import AxesDatabaseHandler
 from axes.models import AccessAttempt, AccessLog, AccessFailureLog, AccessAttemptExpiration
+from axes.conf import LockoutTier
+from axes.helpers import get_cool_off_for_failures
 
 
 from django.core.cache import cache
@@ -797,3 +799,231 @@ class AxesDatabaseHandlerExpirationFlagTestCase(AxesTestCase):
             "AXES: Skipping clean for expired access attempts because no AXES_COOLOFF_TIME is configured"
         )
         self.assertEqual(count, 0)
+
+
+TIERS = [
+    LockoutTier(failures=5, cooloff=timedelta(minutes=15)),
+    LockoutTier(failures=10, cooloff=timedelta(hours=2)),
+]
+
+
+@override_settings(
+    AXES_HANDLER="axes.handlers.database.AxesDatabaseHandler",
+    AXES_LOCKOUT_TIERS=TIERS,
+    AXES_COOLOFF_TIME=None,
+)
+class AxesDatabaseHandlerTierWindowTestCase(AxesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.handler = AxesDatabaseHandler()
+
+    def _record_failure(self, username="tier-user"):
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            credentials={"username": username, "password": "wrong"},
+            request=self.request,
+        )
+
+    def _create_attempt(self, *, failures, age, username="tier-user", cooloff=None):
+        cooloff = cooloff or get_cool_off_for_failures(failures)
+        attempt = AccessAttempt.objects.create(
+            username=username,
+            ip_address=self.ip_address,
+            user_agent=self.user_agent,
+            http_accept="text/html",
+            path_info=self.path_info,
+            failures_since_start=failures,
+            cooloff_seconds=int(cooloff.total_seconds()),
+        )
+        # attempt_time is auto_now_add, so backdate it after creation.
+        AccessAttempt.objects.filter(pk=attempt.pk).update(
+            attempt_time=datetime.now() - age
+        )
+        attempt.refresh_from_db()
+        return attempt
+
+    def test_failure_records_tier_window_on_attempt(self):
+        for _ in range(5):
+            self._record_failure()
+
+        attempt = AccessAttempt.objects.get(username="tier-user")
+        self.assertEqual(attempt.failures_since_start, 5)
+        self.assertEqual(
+            attempt.cooloff_seconds, int(timedelta(minutes=15).total_seconds())
+        )
+
+        for _ in range(5):
+            self._record_failure()
+
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.failures_since_start, 10)
+        self.assertEqual(
+            attempt.cooloff_seconds, int(timedelta(hours=2).total_seconds())
+        )
+
+    def test_clean_expired_uses_each_records_own_window(self):
+        # First-tier record whose 15 minute window has elapsed.
+        expired = self._create_attempt(
+            username="short-window",
+            failures=5,
+            age=timedelta(minutes=16),
+        )
+        # Higher-tier record whose 2 hour window is still open even though
+        # it is much older than the first-tier window.
+        retained = self._create_attempt(
+            username="long-window",
+            failures=10,
+            age=timedelta(hours=1),
+        )
+
+        count = self.handler.clean_expired_user_attempts(request=self.request)
+
+        self.assertEqual(count, 1)
+        self.assertFalse(AccessAttempt.objects.filter(pk=expired.pk).exists())
+        self.assertTrue(AccessAttempt.objects.filter(pk=retained.pk).exists())
+
+    def test_get_user_attempts_keeps_higher_tier_past_short_window(self):
+        self._create_attempt(failures=10, age=timedelta(minutes=30))
+
+        attempts_list = self.handler.get_user_attempts(self.request, self.credentials)
+        counted = sum(queryset.count() for queryset in attempts_list)
+        self.assertEqual(counted, 1)
+        self.assertEqual(self.handler.get_failures(self.request, self.credentials), 10)
+
+    def test_get_user_attempts_drops_attempt_past_its_own_window(self):
+        self._create_attempt(failures=10, age=timedelta(hours=3))
+
+        attempts_list = self.handler.get_user_attempts(self.request, self.credentials)
+        self.assertEqual(sum(qs.count() for qs in attempts_list), 0)
+        self.assertEqual(self.handler.get_failures(self.request, self.credentials), 0)
+
+    def test_clean_expired_runs_without_global_cooloff(self):
+        self._create_attempt(failures=5, age=timedelta(minutes=20))
+
+        count = self.handler.clean_expired_user_attempts(request=None)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(AccessAttempt.objects.count(), 0)
+
+    def test_legacy_record_without_stored_window_uses_tier_fallback(self):
+        legacy = AccessAttempt.objects.create(
+            username="legacy-user",
+            ip_address=self.ip_address,
+            user_agent=self.user_agent,
+            http_accept="text/html",
+            path_info=self.path_info,
+            failures_since_start=10,
+            cooloff_seconds=None,
+        )
+        AccessAttempt.objects.filter(pk=legacy.pk).update(
+            attempt_time=datetime.now() - timedelta(hours=1)
+        )
+
+        count = self.handler.clean_expired_user_attempts(request=self.request)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(AccessAttempt.objects.count(), 1)
+
+    def test_pausing_for_short_window_does_not_reset_higher_tier(self):
+        # Ten failures push the account onto the 2 hour tier.
+        self._create_attempt(failures=10, age=timedelta(minutes=20))
+
+        # Waiting longer than the 15 minute first-tier window must not
+        # clear the higher-tier history.
+        self._record_failure()
+
+        attempt = AccessAttempt.objects.get(username="tier-user")
+        self.assertEqual(attempt.failures_since_start, 11)
+        self.assertEqual(
+            attempt.cooloff_seconds, int(timedelta(hours=2).total_seconds())
+        )
+
+    def test_account_unlocks_once_its_own_tier_window_elapses(self):
+        # Reproduces the reported bug: ten failures a month ago must not
+        # keep the account on the 2 hour tier today.
+        self._create_attempt(failures=10, age=timedelta(days=30))
+
+        self.assertFalse(AxesProxyHandler.is_locked(self.request, self.credentials))
+
+        # The next failure starts a fresh record back on the first tier.
+        self._record_failure()
+
+        fresh = AccessAttempt.objects.get(username="tier-user")
+        self.assertEqual(fresh.failures_since_start, 1)
+        self.assertEqual(
+            fresh.cooloff_seconds, int(timedelta(minutes=15).total_seconds())
+        )
+        self.assertFalse(AxesProxyHandler.is_locked(self.request, self.credentials))
+
+
+@override_settings(
+    AXES_HANDLER="axes.handlers.database.AxesDatabaseHandler",
+    AXES_LOCKOUT_TIERS=TIERS,
+    AXES_COOLOFF_TIME=None,
+    AXES_USE_ATTEMPT_EXPIRATION=True,
+)
+class AxesDatabaseHandlerTierExpirationTestCase(AxesTestCase):
+    def setUp(self):
+        super().setUp()
+        self.handler = AxesDatabaseHandler()
+
+    def _record_failure(self):
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            credentials={"username": "tier-user", "password": "wrong"},
+            request=self.request,
+        )
+
+    def test_failure_creates_expiration_from_record_window(self):
+        self._record_failure()
+
+        attempt = AccessAttempt.objects.get(username="tier-user")
+        self.assertIsNotNone(attempt.expiration)
+        window = attempt.expiration.expires_at - attempt.attempt_time
+        self.assertAlmostEqual(window.total_seconds(), 15 * 60, delta=2)
+
+    def test_expiration_tracks_longer_window_on_tier_change(self):
+        for _ in range(10):
+            self._record_failure()
+
+        attempt = AccessAttempt.objects.get(username="tier-user")
+        window = attempt.expiration.expires_at - attempt.attempt_time
+        self.assertAlmostEqual(window.total_seconds(), 2 * 60 * 60, delta=2)
+
+
+@override_settings(
+    AXES_HANDLER="axes.handlers.cache.AxesCacheHandler",
+    AXES_LOCKOUT_TIERS=TIERS,
+    AXES_COOLOFF_TIME=None,
+)
+class AxesCacheHandlerTierWindowTestCase(AxesTestCase):
+    @patch.object(cache, "add")
+    def test_first_failure_seeds_key_with_first_tier_timeout(self, cache_add):
+        AxesProxyHandler.user_login_failed(
+            sender=MagicMock(),
+            credentials={"username": "tier-user", "password": "wrong"},
+            request=self.request,
+        )
+
+        cache_add.assert_called_with(
+            key=cache_add.call_args.kwargs["key"],
+            value=1,
+            timeout=int(timedelta(minutes=15).total_seconds()),
+        )
+
+    @patch.object(cache, "touch")
+    @patch.object(cache, "incr", return_value=10)
+    @patch.object(cache, "add", return_value=False)
+    def test_higher_failure_uses_longer_tier_timeout(
+        self, cache_add, cache_incr, cache_touch
+    ):
+        AxesProxyHandler.user_login_failed(
+            sender=MagicMock(),
+            credentials={"username": "tier-user", "password": "wrong"},
+            request=self.request,
+        )
+
+        cache_touch.assert_called_with(
+            key=cache_touch.call_args.kwargs["key"],
+            timeout=int(timedelta(hours=2).total_seconds()),
+        )

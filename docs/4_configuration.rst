@@ -126,6 +126,29 @@ The ``AXES_USE_USER_AGENT`` setting can be used with username and IP address or 
 but does nothing when the ``AXES_ONLY_USER_FAILURES`` setting is set.
 
 
+Progressive lockout tier windows
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``AXES_LOCKOUT_TIERS`` is set, leave ``AXES_COOLOFF_TIME`` unset
+(``None``); the tiers supply the cool-off windows themselves. Each failed
+attempt stores the window of the tier it belongs to in the
+``AccessAttempt.cooloff_seconds`` field, so counting and cleanup follow the
+record's own tier instead of a single global setting.
+
+An attempt is counted only while its own window is open: a record on the
+15 minute tier expires after 15 minutes, while a record on the 2 hour tier
+stays active for the full 2 hours. Higher-tier history is therefore not
+cleared by the shorter first-tier window, which prevents an attacker from
+dropping back to the first tier simply by pausing between bursts. Expired
+records are removed automatically on the next failed login, successful
+login or logout, and can also be removed from the admin with the
+"Clean up expired attempts" action.
+
+Attempts created before the tier windows were tracked have no stored
+window; they fall back to the tier matching their failure count and only
+become permanent when no window can be resolved.
+
+
 Configuring reverse proxies
 ---------------------------
 

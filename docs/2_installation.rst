@@ -89,7 +89,9 @@ django-axes 9.0. Python 3.10 and Django 4.2 are no longer supported.
 Run ``python manage.py migrate`` after upgrading, even if
 ``AXES_USE_ATTEMPT_EXPIRATION`` is disabled. The
 ``axes.0010_accessattemptexpiration`` migration introduced in 8.1.0 is required
-when deleting access attempts. Version 9.0 adds no new migrations.
+when deleting access attempts. Version 9.0 adds no new migrations, and the
+``axes.0011_accessattempt_cooloff_seconds`` migration adds the per-attempt
+cool-off window used by ``AXES_LOCKOUT_TIERS``.
 
 Usernames are now truncated to the Axes username field's maximum length before
 logging and lockout lookups, including usernames returned by
