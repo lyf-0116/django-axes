@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 from hashlib import sha256
 from unittest.mock import patch
@@ -27,6 +28,8 @@ from axes.helpers import (
     is_ip_address_in_blacklist,
     is_ip_address_in_whitelist,
     is_user_attempt_whitelisted,
+    make_cache_key_list,
+    make_legacy_cache_key_list,
     resolve_callable,
     set_retry_after_header,
     toggleable,
@@ -601,8 +604,11 @@ class ClientCacheKeyTestCase(AxesTestCase):
         Test the cache key format.
         """
 
-        cache_hash_digest = sha256(self.ip_address.encode()).hexdigest()
-        cache_hash_key = f"axes-{cache_hash_digest}"
+        cache_key_components = json.dumps(
+            {"ip_address": self.ip_address}, sort_keys=True
+        )
+        cache_hash_digest = sha256(cache_key_components.encode()).hexdigest()
+        cache_hash_key = f"axes-v2-{cache_hash_digest}"
 
         # Getting cache key from request
         request_factory = RequestFactory()
@@ -633,8 +639,11 @@ class ClientCacheKeyTestCase(AxesTestCase):
 
         empty_ip_address = ""
 
-        cache_hash_digest = sha256(empty_ip_address.encode()).hexdigest()
-        cache_hash_key = f"axes-{cache_hash_digest}"
+        cache_key_components = json.dumps(
+            {"ip_address": empty_ip_address}, sort_keys=True
+        )
+        cache_hash_digest = sha256(cache_key_components.encode()).hexdigest()
+        cache_hash_key = f"axes-v2-{cache_hash_digest}"
 
         # Getting cache key from request
         request_factory = RequestFactory()
@@ -666,8 +675,11 @@ class ClientCacheKeyTestCase(AxesTestCase):
         """
 
         ip_address = self.ip_address
-        cache_hash_digest = sha256(ip_address.encode()).hexdigest()
-        cache_hash_key = f"axes-{cache_hash_digest}"
+        cache_key_components = json.dumps(
+            {"ip_address": ip_address}, sort_keys=True
+        )
+        cache_hash_digest = sha256(cache_key_components.encode()).hexdigest()
+        cache_hash_key = f"axes-v2-{cache_hash_digest}"
 
         # Getting cache key from request
         request_factory = RequestFactory()
@@ -692,6 +704,78 @@ class ClientCacheKeyTestCase(AxesTestCase):
             failures_since_start=0,
         )
         self.assertEqual([cache_hash_key], get_client_cache_keys(attempt))
+
+    def test_cache_key_is_independent_of_field_order(self):
+        username_first = make_cache_key_list(
+            [{"username": "axes-user", "ip_address": "192.0.2.1"}]
+        )
+        ip_first = make_cache_key_list(
+            [{"ip_address": "192.0.2.1", "username": "axes-user"}]
+        )
+
+        self.assertEqual(username_first, ip_first)
+
+    def test_client_cache_key_ignores_combined_parameter_order(self):
+        attempt = AccessAttempt(
+            username="axes-user", ip_address="192.0.2.1"
+        )
+
+        with override_settings(
+            AXES_LOCKOUT_PARAMETERS=[["username", "ip_address"]]
+        ):
+            username_first = get_client_cache_keys(attempt)
+
+        with override_settings(
+            AXES_LOCKOUT_PARAMETERS=[["ip_address", "username"]]
+        ):
+            ip_first = get_client_cache_keys(attempt)
+
+        self.assertEqual(username_first, ip_first)
+
+    def test_cache_key_separates_field_names_and_value_boundaries(self):
+        ambiguous_single_fields = (
+            ({"username": "192.0.2.1"}, {"ip_address": "192.0.2.1"}),
+            (
+                {"username": "ab", "ip_address": "c"},
+                {"username": "a", "ip_address": "bc"},
+            ),
+            (
+                {"username": "alice", "ip_address": "192.0.2.1"},
+                {"username": "alice\x00ip_address", "ip_address": "1"},
+            ),
+        )
+
+        for first_kwargs, second_kwargs in ambiguous_single_fields:
+            with self.subTest(first=first_kwargs, second=second_kwargs):
+                self.assertNotEqual(
+                    make_cache_key_list([first_kwargs]),
+                    make_cache_key_list([second_kwargs]),
+                )
+
+    def test_legacy_cache_keys_keep_unsafe_value_concatenation(self):
+        value = "192.0.2.1"
+        new_key = make_cache_key_list([{"ip_address": value}])[0]
+        legacy_key = make_legacy_cache_key_list([{"ip_address": value}])[0]
+
+        self.assertTrue(new_key.startswith("axes-v2-"))
+        self.assertTrue(legacy_key.startswith("axes-"))
+        self.assertNotEqual(new_key, legacy_key)
+
+        self.assertEqual(
+            make_legacy_cache_key_list([{"username": value}]),
+            make_legacy_cache_key_list([{"ip_address": value}]),
+        )
+        with override_settings(
+            AXES_LOCKOUT_PARAMETERS=["username", "ip_address"]
+        ):
+            self.assertCountEqual(
+                get_client_cache_keys(
+                    AccessAttempt(username=value, ip_address=None), legacy=True
+                ),
+                get_client_cache_keys(
+                    AccessAttempt(username=None, ip_address=value), legacy=True
+                ),
+            )
 
 
 class UsernameTestCase(AxesTestCase):

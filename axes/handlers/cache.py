@@ -34,7 +34,6 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
         username: Optional[str] = None,
         ip_or_username: bool = False,
     ) -> int:
-        cache_keys: list = []
         count = 0
 
         if ip_address is None and username is None:
@@ -44,15 +43,17 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
                 "Due to the cache key ip_or_username=True is not supported"
             )
 
-        cache_keys.extend(
-            get_client_cache_keys(
-                AccessAttempt(username=username, ip_address=ip_address)
-            )
-        )
+        attempt = AccessAttempt(username=username, ip_address=ip_address)
+        cache_keys = get_client_cache_keys(attempt)
+        legacy_cache_keys = get_client_cache_keys(attempt, legacy=True)
 
-        for cache_key in cache_keys:
+        for cache_key, legacy_cache_key in zip(cache_keys, legacy_cache_keys):
             deleted = self.cache.delete(cache_key)
-            count += int(deleted) if deleted is not None else 1
+            legacy_deleted = self.cache.delete(legacy_cache_key)
+            if deleted is None or legacy_deleted is None:
+                count += 1
+            elif deleted or legacy_deleted:
+                count += 1
 
         log.info("AXES: Reset %d access attempts from database.", count)
 
@@ -60,10 +61,35 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
 
     def get_failures(self, request, credentials: Optional[dict] = None) -> int:
         cache_keys = get_client_cache_keys(request, credentials)
+        legacy_cache_keys = get_client_cache_keys(request, credentials, legacy=True)
         failure_count = max(
-            self.cache.get(cache_key, default=0) for cache_key in cache_keys
+            self.cache.get(cache_key, default=0)
+            for cache_key in [*cache_keys, *legacy_cache_keys]
         )
         return failure_count
+
+    def _increment_existing_legacy_cache_keys(
+        self, request, credentials, cache_timeout: Optional[int]
+    ) -> list:
+        legacy_failure_counts = []
+        legacy_cache_keys = get_client_cache_keys(request, credentials, legacy=True)
+
+        for legacy_cache_key in legacy_cache_keys:
+            if not self.cache.has_key(legacy_cache_key):
+                continue
+
+            try:
+                legacy_failures = self.cache.incr(key=legacy_cache_key, delta=1)
+            except ValueError:
+                # Missing legacy keys are not recreated. Existing entries are
+                # incremented so pre-deployment counts carry over and continue
+                # to expire with the current cool-off timeout.
+                continue
+
+            self.cache.touch(key=legacy_cache_key, timeout=cache_timeout)
+            legacy_failure_counts.append(legacy_failures)
+
+        return legacy_failure_counts
 
     def user_login_failed(self, sender, credentials: dict, request=None, **kwargs):
         """
@@ -132,6 +158,12 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
                 else:
                     self.cache.touch(key=cache_key, timeout=cache_timeout)
 
+        failures.extend(
+            self._increment_existing_legacy_cache_keys(
+                request, credentials, cache_timeout
+            )
+        )
+
         failures_since_start = max(failures)
         request.axes_failures_since_start = failures_since_start
 
@@ -184,9 +216,14 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
 
         if settings.AXES_RESET_ON_SUCCESS:
             cache_keys = get_client_cache_keys(request, credentials)
-            for cache_key in cache_keys:
-                failures_since_start = self.cache.get(cache_key, default=0)
+            legacy_cache_keys = get_client_cache_keys(request, credentials, legacy=True)
+            for cache_key, legacy_cache_key in zip(cache_keys, legacy_cache_keys):
+                failures_since_start = max(
+                    self.cache.get(cache_key, default=0),
+                    self.cache.get(legacy_cache_key, default=0),
+                )
                 self.cache.delete(cache_key)
+                self.cache.delete(legacy_cache_key)
                 log.info(
                     "AXES: Deleted %d failed login attempts by %s from cache.",
                     failures_since_start,

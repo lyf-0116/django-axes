@@ -13,7 +13,7 @@ from django.urls import reverse
 
 from axes.conf import settings
 from axes.handlers.proxy import AxesProxyHandler
-from axes.helpers import get_client_str
+from axes.helpers import get_client_cache_keys, get_client_str
 from tests.base import AxesTestCase
 
 
@@ -531,6 +531,51 @@ class ResetAttemptsCacheHandlerTestCase(AxesHandlerBaseTestCase):
     def test_handler_reset_attempts_ip_or_username(self):
         with self.assertRaises(NotImplementedError):
             AxesProxyHandler.reset_attempts()
+
+    def test_get_failures_reads_legacy_cache_key(self):
+        legacy_cache_key = get_client_cache_keys(self.request, legacy=True)[0]
+        cache.set(legacy_cache_key, 4)
+
+        self.assertEqual(4, AxesProxyHandler.get_failures(self.request, {}))
+
+    @override_settings(AXES_FAILURE_LIMIT=3)
+    def test_failed_login_carries_legacy_count_forward(self):
+        cache_key = get_client_cache_keys(self.request)[0]
+        legacy_cache_key = get_client_cache_keys(self.request, legacy=True)[0]
+        cache.set(legacy_cache_key, 2)
+
+        AxesProxyHandler.user_login_failed(
+            sender=MagicMock(),
+            credentials={"username": self.USERNAME_1},
+            request=self.request,
+        )
+
+        self.assertEqual(3, cache.get(legacy_cache_key))
+        self.assertEqual(1, cache.get(cache_key))
+        self.assertEqual(3, self.request.axes_failures_since_start)
+        self.assertTrue(self.request.axes_locked_out)
+
+    def test_reset_attempts_deletes_legacy_cache_key(self):
+        legacy_cache_key = get_client_cache_keys(self.request, legacy=True)[0]
+        cache.set(legacy_cache_key, 4)
+
+        self.assertEqual(
+            1, AxesProxyHandler.reset_attempts(ip_address=self.ip_address)
+        )
+        self.assertIsNone(cache.get(legacy_cache_key))
+
+    def test_missing_legacy_cache_key_is_not_recreated(self):
+        cache_key = get_client_cache_keys(self.request)[0]
+        legacy_cache_key = get_client_cache_keys(self.request, legacy=True)[0]
+
+        AxesProxyHandler.user_login_failed(
+            sender=MagicMock(),
+            credentials={"username": self.USERNAME_1},
+            request=self.request,
+        )
+
+        self.assertEqual(1, cache.get(cache_key))
+        self.assertIsNone(cache.get(legacy_cache_key))
 
 
 @override_settings(

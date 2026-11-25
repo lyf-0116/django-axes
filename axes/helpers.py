@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta, datetime
 from hashlib import sha256
 from logging import getLogger
@@ -403,7 +404,30 @@ def get_client_parameters(
     return filter_kwargs
 
 
+def _canonical_cache_key_components(filter_kwargs: dict) -> str:
+    named_values = {
+        str(key): "" if value is None else str(value)
+        for key, value in filter_kwargs.items()
+    }
+    return json.dumps(named_values, sort_keys=True)
+
+
 def make_cache_key_list(filter_kwargs_list: List[dict]) -> List[str]:
+    cache_keys = []
+    for filter_kwargs in filter_kwargs_list:
+        cache_key_components = _canonical_cache_key_components(filter_kwargs)
+        cache_key_digest = sha256(cache_key_components.encode()).hexdigest()
+        cache_keys.append(f"axes-v2-{cache_key_digest}")
+    return cache_keys
+
+
+def make_legacy_cache_key_list(filter_kwargs_list: List[dict]) -> List[str]:
+    """
+    Build the pre-canonicalization cache keys.
+
+    These keys are retained so deployments can read and remove failure counts
+    written by older Axes versions while the old cache entries expire.
+    """
     cache_keys = []
     for filter_kwargs in filter_kwargs_list:
         cache_key_components = "".join(
@@ -417,6 +441,8 @@ def make_cache_key_list(filter_kwargs_list: List[dict]) -> List[str]:
 def get_client_cache_keys(
     request_or_attempt: Union[HttpRequest, AccessBase],
     credentials: Optional[dict] = None,
+    *,
+    legacy: bool = False,
 ) -> List[str]:
     """
     Build cache key name from request or AccessAttempt object.
@@ -425,7 +451,17 @@ def get_client_cache_keys(
     :param credentials: credentials containing user information
     :return cache_key: Hash key that is usable for Django cache backends
     """
+    filter_kwargs_list = _get_client_filter_kwargs(request_or_attempt, credentials)
 
+    if legacy:
+        return make_legacy_cache_key_list(filter_kwargs_list)
+    return make_cache_key_list(filter_kwargs_list)
+
+
+def _get_client_filter_kwargs(
+    request_or_attempt: Union[HttpRequest, AccessBase],
+    credentials: Optional[dict] = None,
+) -> List[dict]:
     if isinstance(request_or_attempt, AccessBase):
         username = request_or_attempt.username
         ip_address = request_or_attempt.ip_address
@@ -435,11 +471,9 @@ def get_client_cache_keys(
         ip_address = get_client_ip_address(request_or_attempt)
         user_agent = get_client_user_agent(request_or_attempt)
 
-    filter_kwargs_list = get_client_parameters(
+    return get_client_parameters(
         username, ip_address, user_agent, request_or_attempt, credentials
     )
-
-    return make_cache_key_list(filter_kwargs_list)
 
 
 def get_client_str(

@@ -234,6 +234,16 @@ to your ``settings.py`` file::
 
 There are no known problems in e.g. ``MemcachedCache`` or Redis based caches.
 
+New cache keys use the ``axes-v2-`` prefix and a SHA-256 digest of the sorted
+lockout fields encoded as JSON. The separate prefix, field names, and encoding
+boundaries prevent e.g. a username that looks like an IP address from sharing
+an IP-only failure count.
+
+During upgrades Axes also reads the previous concatenated-value keys,
+increments them when they already exist, and deletes them on reset or
+successful login. Let ``AXES_COOLOFF_TIME`` elapse (or reset Axes) after
+deployment so these legacy keys can disappear.
+
 
 Configuring authentication backends
 -----------------------------------

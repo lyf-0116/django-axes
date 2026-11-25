@@ -2,6 +2,14 @@
 Changes
 =======
 
+Unreleased
+----------
+
+- Use versioned ``axes-v2-`` cache keys with a canonical JSON digest of sorted,
+  named lockout fields so values cannot collide across fields or parameter
+  order. Existing legacy keys are still read, updated when present, and deleted
+  by resets and successful logins.
+
 9.1.0 (2026-11-22)
 ------------------
 
