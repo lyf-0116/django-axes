@@ -111,6 +111,12 @@ settings.AXES_HANDLER = getattr(
     settings, "AXES_HANDLER", "axes.handlers.database.AxesDatabaseHandler"
 )
 
+# Maximum time to reuse a database failure-count aggregate without querying
+# the database again. Failure writes and resets invalidate it immediately.
+settings.AXES_DATABASE_FAILURE_CACHE_TIMEOUT = getattr(
+    settings, "AXES_DATABASE_FAILURE_CACHE_TIMEOUT", 5
+)
+
 settings.AXES_LOCKOUT_TEMPLATE = getattr(settings, "AXES_LOCKOUT_TEMPLATE", None)
 
 settings.AXES_LOCKOUT_URL = getattr(settings, "AXES_LOCKOUT_URL", None)

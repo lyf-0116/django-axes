@@ -2,6 +2,12 @@
 Changes
 =======
 
+Unreleased
+----------
+
+- Cache the database handler's aggregate failure count for a short,
+  configurable time and invalidate it on attempt writes and resets.
+
 9.1.0 (2026-11-22)
 ------------------
 

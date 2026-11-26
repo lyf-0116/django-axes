@@ -234,6 +234,19 @@ to your ``settings.py`` file::
 
 There are no known problems in e.g. ``MemcachedCache`` or Redis based caches.
 
+The database handler also uses ``AXES_CACHE`` for a short-lived copy of the
+aggregate failure count. This avoids running the aggregate query on every login
+page request while keeping lockout checks current: saving an
+``AccessAttempt`` and resetting attempts delete the related cache keys
+immediately. The timeout is capped by the remaining cool-off time. The default
+5 second maximum can be configured with::
+
+    AXES_DATABASE_FAILURE_CACHE_TIMEOUT = 2
+
+Set the value to ``0`` to expire cached counts immediately. Multi-process
+deployments should use a shared cache such as Redis or Memcached so that cache
+invalidations from one process are visible to the other processes.
+
 
 Configuring authentication backends
 -----------------------------------

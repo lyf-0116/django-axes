@@ -1,9 +1,9 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from logging import getLogger
 from typing import List, Optional
 
 from django.db import router, transaction
-from django.db.models import F, Q, QuerySet, Sum, Value
+from django.db.models import F, Max, Q, QuerySet, Sum, Value
 from django.db.models.functions import Concat
 from django.http import HttpRequest
 from django.http.multipartparser import MultiPartParserError
@@ -13,6 +13,9 @@ from axes.attempts import get_cool_off_threshold
 from axes.conf import settings
 from axes.handlers.base import AbstractAxesHandler, AxesBaseHandler
 from axes.helpers import (
+    get_cache,
+    get_cache_timeout,
+    get_client_cache_keys,
     get_client_parameters,
     get_client_session_hash,
     get_client_str,
@@ -42,6 +45,9 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
               process, caching its output can be dangerous.
     """
 
+    def __init__(self):
+        self.cache = get_cache()
+
     def reset_attempts(
         self,
         *,
@@ -59,10 +65,67 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
             if username:
                 attempts = attempts.filter(username=username)
 
+        cache_keys = self.get_attempt_cache_keys(attempts)
         count, _ = attempts.delete()
+        self.delete_failure_cache_keys(cache_keys)
         log.info("AXES: Reset %d access attempts from database.", count)
 
         return count
+
+    def get_attempt_cache_keys(self, attempts: QuerySet[AccessAttempt]) -> List[str]:
+        """
+        Return cache keys for the distinct lockout fields in *attempts*.
+        """
+
+        cache_keys = set()
+        values = attempts.values("username", "ip_address", "user_agent").distinct()
+        for values_row in values:
+            attempt = AccessAttempt(**values_row)
+            cache_keys.update(get_client_cache_keys(attempt))
+        return list(cache_keys)
+
+    def delete_failure_cache_keys(self, cache_keys: List[str]) -> None:
+        for cache_key in cache_keys:
+            self.cache.delete(cache_key)
+
+        if cache_keys:
+
+            def delete_after_commit() -> None:
+                for cache_key in cache_keys:
+                    self.cache.delete(cache_key)
+
+            transaction.on_commit(
+                delete_after_commit,
+                using=router.db_for_write(AccessAttempt),
+            )
+
+    def invalidate_failure_cache(
+        self, request: HttpRequest, credentials: Optional[dict] = None
+    ) -> None:
+        self.delete_failure_cache_keys(get_client_cache_keys(request, credentials))
+
+    def invalidate_attempt_failure_cache(self, instance: AccessAttempt) -> None:
+        self.delete_failure_cache_keys(get_client_cache_keys(instance))
+
+    def get_failure_cache_timeout(
+        self,
+        request: HttpRequest,
+        latest_attempt_time: Optional[datetime] = None,
+    ) -> Optional[int]:
+        timeout = getattr(
+            settings,
+            "AXES_DATABASE_FAILURE_CACHE_TIMEOUT",
+            5,
+        )
+        cooloff_timeout = get_cache_timeout(request)
+        if cooloff_timeout is not None:
+            if latest_attempt_time is not None:
+                age = timezone.now() - latest_attempt_time
+                cooloff_timeout = max(0, int(cooloff_timeout - age.total_seconds()))
+            if timeout is not None:
+                return min(timeout, cooloff_timeout)
+            return cooloff_timeout
+        return timeout
 
     def reset_logs(self, *, age_days: Optional[int] = None) -> int:
         if age_days is None:
@@ -110,17 +173,31 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         return count
 
     def get_failures(self, request, credentials: Optional[dict] = None) -> int:
+        cache_keys = get_client_cache_keys(request, credentials)
         attempts_list = self.get_user_attempts(request, credentials)
-        attempt_count = max(
-            (
-                attempts.aggregate(Sum("failures_since_start"))[
-                    "failures_since_start__sum"
-                ]
-                or 0
-            )
-            for attempts in attempts_list
-        )
-        return attempt_count
+        failure_count = 0
+
+        for cache_key, attempts in zip(cache_keys, attempts_list):
+            cached_count = self.cache.get(cache_key)
+            if cached_count is None:
+                aggregate = attempts.aggregate(
+                    Sum("failures_since_start"),
+                    Max("attempt_time"),
+                )
+                attempt_count = aggregate["failures_since_start__sum"] or 0
+                self.cache.set(
+                    cache_key,
+                    attempt_count,
+                    timeout=self.get_failure_cache_timeout(
+                        request, aggregate.get("attempt_time__max")
+                    ),
+                )
+            else:
+                attempt_count = cached_count
+
+            failure_count = max(failure_count, attempt_count)
+
+        return failure_count
 
     def user_login_failed(self, sender, credentials: dict, request=None, **kwargs):
         """
@@ -248,6 +325,8 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
                             attempt.expiration.expires_at,
                         )
                         attempt.expiration.save()
+
+        self.invalidate_failure_cache(request, credentials)
 
         # 3. or 4. database query: Calculate the current maximum failure number from the existing attempts
         failures_since_start = self.get_failures(request, credentials)
@@ -449,6 +528,8 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         for attempts in attempts_list:
             _count, _ = attempts.delete()
             count += _count
+
+        self.invalidate_failure_cache(request, credentials)
         log.info("AXES: Reset %s access attempts from database.", count)
 
         return count
@@ -460,6 +541,7 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         When needed, all post_save actions for this backend should be located
         here.
         """
+        self.invalidate_attempt_failure_cache(instance)
 
     def post_delete_access_attempt(self, instance, **kwargs):
         """
@@ -468,3 +550,4 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         When needed, all post_delete actions for this backend should be located
         here.
         """
+        self.invalidate_attempt_failure_cache(instance)
