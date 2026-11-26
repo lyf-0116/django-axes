@@ -91,11 +91,11 @@ Run ``python manage.py migrate`` after upgrading, even if
 ``axes.0010_accessattemptexpiration`` migration introduced in 8.1.0 is required
 when deleting access attempts. Version 9.0 adds no new migrations.
 
-Usernames are now truncated to the Axes username field's maximum length before
-logging and lockout lookups, including usernames returned by
-``AXES_USERNAME_CALLABLE``. Usernames that share the same truncated prefix
-share username-based lockout tracking. Custom username callables should return
-identifiers that fit within this limit.
+Usernames longer than the Axes username field's maximum length are hashed
+before logging and lockout lookups, including usernames returned by
+``AXES_USERNAME_CALLABLE``. This keeps usernames that only differ after the
+field limit in separate lockout buckets. Attempts stored by earlier versions
+under a truncated username are still counted until they expire.
 
 When ``AXES_USERNAME_FORM_FIELD`` is missing from credentials or request data,
 Axes now falls back to the user model's ``USERNAME_FIELD``. Review custom

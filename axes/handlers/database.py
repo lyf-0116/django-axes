@@ -13,7 +13,7 @@ from axes.attempts import get_cool_off_threshold
 from axes.conf import settings
 from axes.handlers.base import AbstractAxesHandler, AxesBaseHandler
 from axes.helpers import (
-    get_client_parameters,
+    get_client_parameters_with_lockout_keys,
     get_client_session_hash,
     get_client_str,
     get_client_username,
@@ -22,6 +22,7 @@ from axes.helpers import (
     get_lockout_parameters,
     get_query_str,
     get_attempt_expiration,
+    get_username_lockout_keys,
 )
 from axes.models import (
     AccessAttempt,
@@ -50,14 +51,17 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         ip_or_username: bool = False,
     ) -> int:
         attempts = AccessAttempt.objects.all()
+        username_keys = get_username_lockout_keys(username)
 
         if ip_or_username:
-            attempts = attempts.filter(Q(ip_address=ip_address) | Q(username=username))
+            attempts = attempts.filter(
+                Q(ip_address=ip_address) | Q(username__in=username_keys)
+            )
         else:
             if ip_address:
                 attempts = attempts.filter(ip_address=ip_address)
             if username:
-                attempts = attempts.filter(username=username)
+                attempts = attempts.filter(username__in=username_keys)
 
         count, _ = attempts.delete()
         log.info("AXES: Reset %d access attempts from database.", count)
@@ -101,7 +105,9 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         limit: Optional[int] = settings.AXES_ACCESS_FAILURE_LOG_PER_USER_LIMIT,
     ) -> int:
         count = 0
-        failures = AccessFailureLog.objects.filter(username=username)
+        failures = AccessFailureLog.objects.filter(
+            username__in=get_username_lockout_keys(username)
+        )
         out_of_limit_failures_logs = failures.count() - limit
         if out_of_limit_failures_logs > 0:
             for failure in failures[:out_of_limit_failures_logs]:
@@ -363,14 +369,8 @@ class AxesDatabaseHandler(AbstractAxesHandler, AxesBaseHandler):
         Return a list querysets of AccessAttempts that match the given request and credentials.
         """
 
-        username = get_client_username(request, credentials)
-
-        filter_kwargs_list = get_client_parameters(
-            username,
-            request.axes_ip_address,
-            request.axes_user_agent,
-            request,
-            credentials,
+        filter_kwargs_list = get_client_parameters_with_lockout_keys(
+            request, credentials
         )
         attempts_list = [
             AccessAttempt.objects.filter(**filter_kwargs)

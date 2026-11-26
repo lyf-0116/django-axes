@@ -16,10 +16,13 @@ from axes.helpers import (
     get_client_parameters,
     get_client_str,
     get_client_username,
+    get_client_username_lockout_keys,
     get_cool_off,
     get_cool_off_iso8601,
     get_lockout_response,
     get_username_from_data,
+    get_username_lockout_key,
+    get_username_lockout_keys,
     get_lockout_tier,
     is_client_ip_address_blacklisted,
     is_client_ip_address_whitelisted,
@@ -695,7 +698,7 @@ class ClientCacheKeyTestCase(AxesTestCase):
 
 
 class UsernameTestCase(AxesTestCase):
-    def test_get_client_username_respects_field_length_for_all_sources(self):
+    def test_get_client_username_hashes_oversized_usernames_for_all_sources(self):
         max_length = AccessBase._meta.get_field("username").max_length
         for source in ("post", "data", "credentials", "callable", "import_string"):
             for username in (
@@ -721,7 +724,11 @@ class UsernameTestCase(AxesTestCase):
                     else:
                         username_callable = "tests.test_helpers.get_username"
 
-                    expected = username[:max_length] if username else username
+                    expected = (
+                        sha256(username.encode()).hexdigest()[:max_length]
+                        if username and len(username) > max_length
+                        else username
+                    )
                     with (
                         override_settings(AXES_USERNAME_CALLABLE=username_callable),
                         patch("tests.test_helpers.get_username", return_value=username),
@@ -732,9 +739,8 @@ class UsernameTestCase(AxesTestCase):
                         )
                     if username and len(username) > max_length:
                         warning.assert_called_once_with(
-                            "AXES: Truncating username of length %s to %s characters to fit the database field.",
+                            "AXES: Hashing username of length %s to fit the database field.",
                             len(username),
-                            max_length,
                         )
                     else:
                         warning.assert_not_called()
@@ -743,16 +749,44 @@ class UsernameTestCase(AxesTestCase):
         field = AccessBase._meta.get_field("username")
         with patch.object(field, "max_length", 8):
             self.assertEqual(
-                "long-use",
+                sha256(b"long-username").hexdigest()[:8],
                 get_client_username(HttpRequest(), {"username": "long-username"}),
             )
 
     @override_settings(AXES_USERNAME_FORM_FIELD="auth-username")
-    def test_get_client_username_truncates_fallback_field(self):
+    def test_get_client_username_hashes_fallback_field(self):
         max_length = AccessBase._meta.get_field("username").max_length
+        username = "x" * (max_length + 1)
         self.assertEqual(
-            "x" * max_length,
-            get_client_username(HttpRequest(), {"username": "x" * (max_length + 1)}),
+            sha256(username.encode()).hexdigest()[:max_length],
+            get_client_username(HttpRequest(), {"username": username}),
+        )
+
+    def test_oversized_usernames_with_common_prefix_have_distinct_keys(self):
+        max_length = AccessBase._meta.get_field("username").max_length
+        prefix = "x" * max_length
+        first = get_username_lockout_key(prefix + "first")
+        second = get_username_lockout_key(prefix + "second")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, get_username_lockout_key(prefix + "first"))
+
+    def test_lockout_keys_include_legacy_truncated_alias(self):
+        max_length = AccessBase._meta.get_field("username").max_length
+        username = "x" * (max_length + 1)
+
+        self.assertEqual(
+            [
+                get_username_lockout_key(username),
+                username[:max_length],
+            ],
+            get_username_lockout_keys(username),
+        )
+        self.assertEqual(
+            get_username_lockout_keys(username),
+            get_client_username_lockout_keys(
+                HttpRequest(), {"username": username}
+            ),
         )
 
     @override_settings(AXES_USERNAME_FORM_FIELD="username")

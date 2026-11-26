@@ -2,6 +2,14 @@
 Changes
 =======
 
+Unreleased
+----------
+
+- Hash usernames longer than the username field limit instead of truncating
+  them, so usernames with a common prefix no longer share lockout attempts.
+  Existing attempts and cache entries written with truncated usernames are
+  still counted until they expire.
+
 9.1.0 (2026-11-22)
 ------------------
 

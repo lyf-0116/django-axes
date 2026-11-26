@@ -153,7 +153,8 @@ into ``my_namespace-username``:
    You still have to make these modifications yourself before calling
    authenticate. If you want to re-use the same function for consistency, that's
    fine, but Axes does not inject these changes into the authentication flow
-   for you.
+   for you. Values longer than the username field limit are hashed before they
+   are stored or used for lockout lookups.
 
 Customizing lockout responses
 -----------------------------

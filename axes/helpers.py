@@ -233,6 +233,73 @@ def get_username_from_data(data: dict) -> Optional[str]:
     return username
 
 
+def get_username_lockout_key(username: Optional[str]) -> Optional[str]:
+    """
+    Return the username value used for lockout writes and lookups.
+
+    Usernames that fit in ``AccessBase.username`` are returned unchanged.
+    Longer usernames are replaced with a SHA-256 digest so that usernames
+    which only differ after the field limit can never share a lockout bucket.
+    """
+
+    if not isinstance(username, str):
+        return username
+
+    max_length = AccessBase._meta.get_field("username").max_length
+    if len(username) <= max_length:
+        return username
+
+    log.warning(
+        "AXES: Hashing username of length %s to fit the database field.",
+        len(username),
+    )
+    return sha256(force_bytes(username)).hexdigest()[:max_length]
+
+
+def get_username_lockout_keys(username: Optional[str]) -> List[Optional[str]]:
+    """
+    Return the current lockout key and the legacy truncated alias.
+
+    Records written before usernames were hashed contain the truncated
+    username. The alias keeps those records readable while they expire.
+    """
+
+    key = get_username_lockout_key(username)
+    if not isinstance(username, str):
+        return [key]
+
+    max_length = AccessBase._meta.get_field("username").max_length
+    if len(username) <= max_length:
+        return [key]
+
+    legacy_key = username[:max_length]
+    return [key, legacy_key]
+
+
+def _get_client_username(
+    request: HttpRequest, credentials: Optional[dict] = None
+) -> Optional[str]:
+    if settings.AXES_USERNAME_CALLABLE:
+        log.debug("Using settings.AXES_USERNAME_CALLABLE to get username")
+        username_func = resolve_callable(
+            settings.AXES_USERNAME_CALLABLE,
+            "settings.AXES_USERNAME_CALLABLE needs to be a string, callable, or None.",
+        )
+        return username_func(request, credentials)
+
+    if credentials:
+        log.debug(
+            "Using parameter credentials to get username with key settings.AXES_USERNAME_FORM_FIELD"
+        )
+        return get_username_from_data(credentials)
+
+    log.debug(
+        "Using parameter request.POST to get username with key settings.AXES_USERNAME_FORM_FIELD"
+    )
+    request_data = getattr(request, "data", request.POST)
+    return get_username_from_data(request_data)
+
+
 def get_client_username(
     request: HttpRequest, credentials: Optional[dict] = None
 ) -> str:
@@ -245,41 +312,25 @@ def get_client_username(
     2. If given, use ``credentials`` and fetch username from ``AXES_USERNAME_FORM_FIELD`` (defaults to ``username``)
     3. Use request.POST and fetch username from ``AXES_USERNAME_FORM_FIELD`` (defaults to ``username``)
 
-    Truncate usernames to the maximum length of ``AccessBase.username`` so
-    database records and lockout lookups use the same value.
+    Hash usernames that exceed the maximum length of ``AccessBase.username``
+    so database records and lockout lookups use the same collision-free key.
 
     :param request: incoming Django ``HttpRequest`` or similar object from authentication backend or other source
     :param credentials: incoming credentials ``dict`` or similar object from authentication backend or other source
     """
 
-    if settings.AXES_USERNAME_CALLABLE:
-        log.debug("Using settings.AXES_USERNAME_CALLABLE to get username")
-        username_func = resolve_callable(
-            settings.AXES_USERNAME_CALLABLE,
-            "settings.AXES_USERNAME_CALLABLE needs to be a string, callable, or None.",
-        )
-        username = username_func(request, credentials)
-    elif credentials:
-        log.debug(
-            "Using parameter credentials to get username with key settings.AXES_USERNAME_FORM_FIELD"
-        )
-        username = get_username_from_data(credentials)
-    else:
-        log.debug(
-            "Using parameter request.POST to get username with key settings.AXES_USERNAME_FORM_FIELD"
-        )
-        request_data = getattr(request, "data", request.POST)
-        username = get_username_from_data(request_data)
+    username = _get_client_username(request, credentials)
+    return get_username_lockout_key(username)  # type: ignore[return-value]
 
-    max_length = AccessBase._meta.get_field("username").max_length
-    if isinstance(username, str) and len(username) > max_length:
-        log.warning(
-            "AXES: Truncating username of length %s to %s characters to fit the database field.",
-            len(username),
-            max_length,
-        )
-        username = username[:max_length]
-    return username  # type: ignore[return-value]
+
+def get_client_username_lockout_keys(
+    request: HttpRequest, credentials: Optional[dict] = None
+) -> List[Optional[str]]:
+    """
+    Return the current and legacy lockout keys for the client username.
+    """
+
+    return get_username_lockout_keys(_get_client_username(request, credentials))
 
 
 def get_client_ip_address(
@@ -403,6 +454,55 @@ def get_client_parameters(
     return filter_kwargs
 
 
+def _get_client_parameters_for_username(
+    request_or_attempt: Union[HttpRequest, AccessBase],
+    username: Optional[str],
+    credentials: Optional[dict] = None,
+) -> List[dict]:
+    if isinstance(request_or_attempt, AccessBase):
+        ip_address = request_or_attempt.ip_address
+        user_agent = request_or_attempt.user_agent
+    else:
+        ip_address = get_client_ip_address(request_or_attempt)
+        user_agent = get_client_user_agent(request_or_attempt)
+
+    return get_client_parameters(
+        username, ip_address, user_agent, request_or_attempt, credentials  # type: ignore[arg-type]
+    )
+
+
+def get_client_parameters_with_lockout_keys(
+    request_or_attempt: Union[HttpRequest, AccessBase],
+    credentials: Optional[dict] = None,
+) -> List[dict]:
+    """
+    Build query parameters that also match legacy truncated usernames.
+
+    Username criteria use ``username__in`` with the current key and the
+    pre-hashing truncated alias. Other criteria stay unchanged.
+    """
+
+    if isinstance(request_or_attempt, AccessBase):
+        username_keys = get_username_lockout_keys(request_or_attempt.username)
+    else:
+        username_keys = get_client_username_lockout_keys(
+            request_or_attempt, credentials
+        )
+
+    filter_kwargs_list = _get_client_parameters_for_username(
+        request_or_attempt, username_keys[0], credentials
+    )
+    if len(username_keys) == 1:
+        return filter_kwargs_list
+
+    for filter_kwargs in filter_kwargs_list:
+        if "username" in filter_kwargs:
+            filter_kwargs["username__in"] = username_keys
+            del filter_kwargs["username"]
+
+    return filter_kwargs_list
+
+
 def make_cache_key_list(filter_kwargs_list: List[dict]) -> List[str]:
     cache_keys = []
     for filter_kwargs in filter_kwargs_list:
@@ -427,19 +527,50 @@ def get_client_cache_keys(
     """
 
     if isinstance(request_or_attempt, AccessBase):
-        username = request_or_attempt.username
-        ip_address = request_or_attempt.ip_address
-        user_agent = request_or_attempt.user_agent
+        username_keys = get_username_lockout_keys(request_or_attempt.username)
     else:
-        username = get_client_username(request_or_attempt, credentials)
-        ip_address = get_client_ip_address(request_or_attempt)
-        user_agent = get_client_user_agent(request_or_attempt)
+        username_keys = get_client_username_lockout_keys(
+            request_or_attempt, credentials
+        )
 
-    filter_kwargs_list = get_client_parameters(
-        username, ip_address, user_agent, request_or_attempt, credentials
+    filter_kwargs_list = _get_client_parameters_for_username(
+        request_or_attempt, username_keys[0], credentials
     )
 
     return make_cache_key_list(filter_kwargs_list)
+
+
+def get_client_cache_key_pairs(
+    request_or_attempt: Union[HttpRequest, AccessBase],
+    credentials: Optional[dict] = None,
+) -> List[tuple]:
+    """
+    Return ``(current_key, legacy_key)`` pairs for every lockout criterion.
+
+    The legacy key points at cache entries written from truncated usernames
+    by older Axes versions. It is equal to the current key when no migration
+    alias is needed.
+    """
+
+    if isinstance(request_or_attempt, AccessBase):
+        username_keys = get_username_lockout_keys(request_or_attempt.username)
+    else:
+        username_keys = get_client_username_lockout_keys(
+            request_or_attempt, credentials
+        )
+
+    filter_kwargs_list = _get_client_parameters_for_username(
+        request_or_attempt, username_keys[0], credentials
+    )
+    cache_keys = make_cache_key_list(filter_kwargs_list)
+    if len(username_keys) == 1:
+        return [(cache_key, cache_key) for cache_key in cache_keys]
+
+    legacy_filter_kwargs_list = _get_client_parameters_for_username(
+        request_or_attempt, username_keys[1], credentials
+    )
+    legacy_cache_keys = make_cache_key_list(legacy_filter_kwargs_list)
+    return list(zip(cache_keys, legacy_cache_keys))
 
 
 def get_client_str(

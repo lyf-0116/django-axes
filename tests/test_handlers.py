@@ -13,7 +13,7 @@ from django.urls import reverse
 
 from axes.conf import settings
 from axes.handlers.proxy import AxesProxyHandler
-from axes.helpers import get_client_str
+from axes.helpers import get_client_str, get_client_username, make_cache_key_list
 from tests.base import AxesTestCase
 
 
@@ -238,7 +238,7 @@ class ResetAttemptsTestCase(AxesHandlerBaseTestCase):
     AXES_ENABLE_ACCESS_FAILURE_LOG=True,
 )
 class AxesDatabaseHandlerTestCase(AxesHandlerBaseTestCase):
-    def test_user_login_failed_truncates_long_username(self):
+    def test_user_login_failed_hashes_long_username(self):
         max_length = AccessAttempt._meta.get_field("username").max_length
         username = "x" * (max_length + 1)
         self.request.POST["username"] = username
@@ -249,11 +249,68 @@ class AxesDatabaseHandlerTestCase(AxesHandlerBaseTestCase):
             )
 
         attempt = AccessAttempt.objects.get()
-        self.assertEqual(username[:max_length], attempt.username)
+        expected = get_client_username(self.request, {"username": username})
+        self.assertEqual(expected, attempt.username)
         self.assertEqual(2, attempt.failures_since_start)
         self.assertEqual(2, AccessFailureLog.objects.count())
         for failure in AccessFailureLog.objects.all():
-            self.assertEqual(username[:max_length], failure.username)
+            self.assertEqual(expected, failure.username)
+
+    @override_settings(
+        AXES_FAILURE_LIMIT=2,
+        AXES_LOCKOUT_PARAMETERS=["username"],
+    )
+    def test_long_usernames_with_common_prefix_do_not_share_failures(self):
+        max_length = AccessAttempt._meta.get_field("username").max_length
+        prefix = "x" * max_length
+        first_username = prefix + "first"
+        second_username = prefix + "second"
+
+        for _ in range(2):
+            AxesProxyHandler.user_login_failed(
+                sender=None,
+                request=self.request,
+                credentials={"username": first_username},
+            )
+        self.assertTrue(self.request.axes_locked_out)
+
+        self.request.axes_locked_out = False
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            request=self.request,
+            credentials={"username": second_username},
+        )
+        self.assertFalse(self.request.axes_locked_out)
+        self.assertEqual(
+            [1, 2],
+            sorted(
+                AccessAttempt.objects.values_list(
+                    "failures_since_start", flat=True
+                )
+            ),
+        )
+
+    @override_settings(
+        AXES_FAILURE_LIMIT=3,
+        AXES_LOCKOUT_PARAMETERS=["username"],
+    )
+    def test_legacy_truncated_username_attempt_is_counted(self):
+        max_length = AccessAttempt._meta.get_field("username").max_length
+        username = "x" * max_length + "new"
+        self.create_attempt(
+            username=username[:max_length], failures_since_start=2
+        )
+
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            request=self.request,
+            credentials={"username": username},
+        )
+
+        self.assertTrue(self.request.axes_locked_out)
+        self.assertTrue(
+            AccessAttempt.objects.filter(username=username[:max_length]).exists()
+        )
 
     def test_handle_json_post_data(self):
         def _raise():
@@ -538,6 +595,65 @@ class ResetAttemptsCacheHandlerTestCase(AxesHandlerBaseTestCase):
     AXES_COOLOFF_TIME=timedelta(seconds=1),
 )
 class AxesCacheHandlerTestCase(AxesHandlerBaseTestCase):
+    @override_settings(
+        AXES_FAILURE_LIMIT=2,
+        AXES_LOCKOUT_PARAMETERS=["username"],
+    )
+    def test_long_usernames_with_common_prefix_do_not_share_failures(self):
+        max_length = AccessAttempt._meta.get_field("username").max_length
+        prefix = "x" * max_length
+        first_username = prefix + "first"
+        second_username = prefix + "second"
+
+        for _ in range(2):
+            AxesProxyHandler.user_login_failed(
+                sender=None,
+                request=self.request,
+                credentials={"username": first_username},
+            )
+        self.assertTrue(self.request.axes_locked_out)
+
+        self.request.axes_locked_out = False
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            request=self.request,
+            credentials={"username": second_username},
+        )
+        self.assertFalse(self.request.axes_locked_out)
+        self.assertEqual(
+            1,
+            AxesProxyHandler.get_failures(
+                self.request, credentials={"username": second_username}
+            ),
+        )
+
+    @override_settings(
+        AXES_FAILURE_LIMIT=3,
+        AXES_LOCKOUT_PARAMETERS=["username"],
+    )
+    def test_legacy_truncated_username_cache_entry_is_counted(self):
+        max_length = AccessAttempt._meta.get_field("username").max_length
+        username = "x" * max_length + "new"
+        legacy_key = make_cache_key_list(
+            [{"username": username[:max_length]}]
+        )[0]
+        cache.set(legacy_key, 2)
+
+        AxesProxyHandler.user_login_failed(
+            sender=None,
+            request=self.request,
+            credentials={"username": username},
+        )
+
+        self.assertTrue(self.request.axes_locked_out)
+        self.assertEqual(2, cache.get(legacy_key))
+        self.assertEqual(
+            3,
+            AxesProxyHandler.get_failures(
+                self.request, credentials={"username": username}
+            ),
+        )
+
     @override_settings(AXES_RESET_ON_SUCCESS=True)
     def test_handler(self):
         self.check_handler()

@@ -6,7 +6,7 @@ from axes.handlers.base import AxesBaseHandler, AbstractAxesHandler
 from axes.helpers import (
     get_cache,
     get_cache_timeout,
-    get_client_cache_keys,
+    get_client_cache_key_pairs,
     get_client_str,
     get_client_username,
     get_credentials,
@@ -34,7 +34,7 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
         username: Optional[str] = None,
         ip_or_username: bool = False,
     ) -> int:
-        cache_keys: list = []
+        cache_keys: set = set()
         count = 0
 
         if ip_address is None and username is None:
@@ -44,11 +44,11 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
                 "Due to the cache key ip_or_username=True is not supported"
             )
 
-        cache_keys.extend(
-            get_client_cache_keys(
-                AccessAttempt(username=username, ip_address=ip_address)
-            )
-        )
+        for cache_key, legacy_cache_key in get_client_cache_key_pairs(
+            AccessAttempt(username=username, ip_address=ip_address)
+        ):
+            cache_keys.add(cache_key)
+            cache_keys.add(legacy_cache_key)
 
         for cache_key in cache_keys:
             deleted = self.cache.delete(cache_key)
@@ -59,11 +59,39 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
         return count
 
     def get_failures(self, request, credentials: Optional[dict] = None) -> int:
-        cache_keys = get_client_cache_keys(request, credentials)
-        failure_count = max(
-            self.cache.get(cache_key, default=0) for cache_key in cache_keys
-        )
-        return failure_count
+        failures = []
+        for cache_key, legacy_cache_key in get_client_cache_key_pairs(
+            request, credentials
+        ):
+            cache_keys = {cache_key, legacy_cache_key}
+            failures.append(sum(self.cache.get(key, default=0) for key in cache_keys))
+        return max(failures)
+
+    def _increment_cache_failure(
+        self,
+        cache_key: str,
+        legacy_cache_key: str,
+        cache_timeout: Optional[int],
+    ) -> int:
+        added = self.cache.add(key=cache_key, value=1, timeout=cache_timeout)
+        if added:
+            failures = 1
+        else:
+            try:
+                failures = self.cache.incr(key=cache_key, delta=1)
+            except ValueError:
+                # The key expired between the add and the incr above, so the
+                # cool off period has elapsed and this failure starts a new
+                # count.
+                self.cache.add(key=cache_key, value=1, timeout=cache_timeout)
+                failures = 1
+            else:
+                self.cache.touch(key=cache_key, timeout=cache_timeout)
+
+        if legacy_cache_key != cache_key:
+            failures += self.cache.get(legacy_cache_key, default=0)
+
+        return failures
 
     def user_login_failed(self, sender, credentials: dict, request=None, **kwargs):
         """
@@ -112,25 +140,16 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
             log.info("AXES: Login failed from whitelisted client %s.", client_str)
             return
 
-        cache_keys = get_client_cache_keys(request, credentials)
         cache_timeout = get_cache_timeout(request)
         failures = []
-        for cache_key in cache_keys:
-            added = self.cache.add(key=cache_key, value=1, timeout=cache_timeout)
-            if added:
-                failures.append(1)
-            else:
-                try:
-                    failures.append(self.cache.incr(key=cache_key, delta=1))
-                except ValueError:
-                    # The key expired between the add and the incr above, so
-                    # the cool off period has elapsed and this failure starts a
-                    # new count. Django's cache API raises ValueError when incr
-                    # is given a missing key, so this is not backend specific.
-                    self.cache.add(key=cache_key, value=1, timeout=cache_timeout)
-                    failures.append(1)
-                else:
-                    self.cache.touch(key=cache_key, timeout=cache_timeout)
+        for cache_key, legacy_cache_key in get_client_cache_key_pairs(
+            request, credentials
+        ):
+            failures.append(
+                self._increment_cache_failure(
+                    cache_key, legacy_cache_key, cache_timeout
+                )
+            )
 
         failures_since_start = max(failures)
         request.axes_failures_since_start = failures_since_start
@@ -183,10 +202,15 @@ class AxesCacheHandler(AbstractAxesHandler, AxesBaseHandler):
         log.info("AXES: Successful login by %s.", client_str)
 
         if settings.AXES_RESET_ON_SUCCESS:
-            cache_keys = get_client_cache_keys(request, credentials)
-            for cache_key in cache_keys:
-                failures_since_start = self.cache.get(cache_key, default=0)
-                self.cache.delete(cache_key)
+            for cache_key, legacy_cache_key in get_client_cache_key_pairs(
+                request, credentials
+            ):
+                cache_keys = {cache_key, legacy_cache_key}
+                failures_since_start = sum(
+                    self.cache.get(key, default=0) for key in cache_keys
+                )
+                for key in cache_keys:
+                    self.cache.delete(key)
                 log.info(
                     "AXES: Deleted %d failed login attempts by %s from cache.",
                     failures_since_start,
